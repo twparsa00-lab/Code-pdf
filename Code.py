@@ -8,17 +8,29 @@ import os, sys, re, time, ssl, socket, uuid, tempfile
 import concurrent.futures as cf
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-import requests
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: requests\n"
+             "  Termux:  pip install requests urllib3")
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ImportError:
+    sys.exit("Missing dependency: matplotlib\n"
+             "  Termux:  pkg install python-numpy python-matplotlib")
 
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image,
-                                Table, TableStyle, HRFlowable)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Image, Table, TableStyle, HRFlowable)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+except ImportError:
+    sys.exit("Missing dependency: reportlab\n"
+             "  Termux:  pip install reportlab")
 
 try:
     import dns.resolver
@@ -40,6 +52,19 @@ def _esc(s):
     return (str(s).replace('&', '&amp;')
                    .replace('<', '&lt;')
                    .replace('>', '&gt;'))
+
+
+def _default_out_dir():
+    """Where to drop the PDF.
+
+    On Termux this is shared storage only once `termux-setup-storage` has
+    been run; otherwise $HOME is used so no phantom storage tree is created.
+    """
+    home = os.path.expanduser('~')
+    shared = os.path.join(home, 'storage', 'shared')
+    if os.path.isdir(shared):
+        return os.path.join(shared, 'sitest')
+    return os.path.join(home, 'sitest')
 
 
 HEADER_WEIGHTS = {
@@ -408,7 +433,12 @@ class SiteAuditor:
         if not self.url.startswith('https'):
             return {'enabled': False}
         try:
+            # Only the presented certificate is read (issuer / expiry), so an
+            # unverified context is deliberate: Termux frequently ships no CA
+            # bundle, which would otherwise fail every HTTPS check.
             ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((self.domain, 443), timeout=6) as s:
                 with ctx.wrap_socket(s, server_hostname=self.domain) as ss:
                     cert = ss.getpeercert()
@@ -705,7 +735,7 @@ class SiteAuditor:
     # ---------- PDF ----------
     def generate_pdf(self):
         print("[+] Generating single-page PDF report...")
-        target_folder = os.path.expanduser('~/storage/shared/sitest')
+        target_folder = _default_out_dir()
         try:
             os.makedirs(target_folder, exist_ok=True)
         except Exception:
@@ -1221,7 +1251,23 @@ if __name__ == '__main__':
     auditor.print_terminal_summary()
 EOF
 chmod +x audit2.py
-cp audit2.py $PREFIX/bin/audit
-chmod +x $PREFIX/bin/audit
-echo ""
-echo "✓ audit updated. Run with:  audit example.com"
+
+# --- install the `audit` command (Termux / Linux) -------------------------
+BINDIR="${PREFIX:-$HOME/.local}/bin"
+mkdir -p "$BINDIR" 2>/dev/null
+install -m 755 audit2.py "$BINDIR/audit" 2>/dev/null \
+    || { cp -f audit2.py "$BINDIR/audit" && chmod 755 "$BINDIR/audit"; }
+hash -r 2>/dev/null || true
+
+# --- fail loudly if the paste was truncated ------------------------------
+PY="$(command -v python3 || command -v python || true)"
+if [ -n "$PY" ] && "$PY" -c \
+        "import ast; ast.parse(open('audit2.py', encoding='utf-8').read())"; then
+    echo ""
+    echo "✓ installed: $BINDIR/audit"
+    echo "  run it with:  audit example.com"
+    [ -d "$HOME/storage/shared" ] || echo \
+        "  tip: run 'termux-setup-storage' once so reports land in shared storage"
+else
+    echo "✗ paste looks truncated — re-copy the whole block and try again"
+fi

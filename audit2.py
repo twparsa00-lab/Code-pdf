@@ -7,17 +7,29 @@ import os, sys, re, time, ssl, socket, uuid, tempfile
 import concurrent.futures as cf
 from datetime import datetime, timezone
 from urllib.parse import urlparse
-import requests
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: requests\n"
+             "  Termux:  pip install requests urllib3")
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+except ImportError:
+    sys.exit("Missing dependency: matplotlib\n"
+             "  Termux:  pkg install python-numpy python-matplotlib")
 
-from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Image,
-                                Table, TableStyle, HRFlowable)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Image, Table, TableStyle, HRFlowable)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+except ImportError:
+    sys.exit("Missing dependency: reportlab\n"
+             "  Termux:  pip install reportlab")
 
 try:
     import dns.resolver
@@ -39,6 +51,19 @@ def _esc(s):
     return (str(s).replace('&', '&amp;')
                    .replace('<', '&lt;')
                    .replace('>', '&gt;'))
+
+
+def _default_out_dir():
+    """Where to drop the PDF.
+
+    On Termux this is shared storage only once `termux-setup-storage` has
+    been run; otherwise $HOME is used so no phantom storage tree is created.
+    """
+    home = os.path.expanduser('~')
+    shared = os.path.join(home, 'storage', 'shared')
+    if os.path.isdir(shared):
+        return os.path.join(shared, 'sitest')
+    return os.path.join(home, 'sitest')
 
 
 HEADER_WEIGHTS = {
@@ -407,7 +432,12 @@ class SiteAuditor:
         if not self.url.startswith('https'):
             return {'enabled': False}
         try:
+            # Only the presented certificate is read (issuer / expiry), so an
+            # unverified context is deliberate: Termux frequently ships no CA
+            # bundle, which would otherwise fail every HTTPS check.
             ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
             with socket.create_connection((self.domain, 443), timeout=6) as s:
                 with ctx.wrap_socket(s, server_hostname=self.domain) as ss:
                     cert = ss.getpeercert()
@@ -704,7 +734,7 @@ class SiteAuditor:
     # ---------- PDF ----------
     def generate_pdf(self):
         print("[+] Generating single-page PDF report...")
-        target_folder = os.path.expanduser('~/storage/shared/sitest')
+        target_folder = _default_out_dir()
         try:
             os.makedirs(target_folder, exist_ok=True)
         except Exception:

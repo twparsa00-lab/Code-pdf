@@ -1,33 +1,37 @@
 cat << 'EOF' > audit2.py
 #!/usr/bin/env python3
 """
-SiteAuditor v2.1 — Real-world security audit with byte-level PoC evidence.
-Single-page PDF, Termux-friendly, no root.
+SiteAuditor v3.0 -- single-page web security & exposure audit.
+
+Built for Termux on Android (no root). Every chart is drawn with ReportLab,
+so matplotlib/numpy are no longer required and startup is much faster.
 """
-import os, sys, re, time, ssl, socket, uuid, tempfile
 import concurrent.futures as cf
+import os
+import re
+import socket
+import ssl
+import sys
+import time
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+# ------------------------------------------------------------- deps -------
 try:
     import requests
 except ImportError:
     sys.exit("Missing dependency: requests\n"
-             "  Termux:  pip install requests urllib3")
+             "  Termux:  pip install requests")
 
 try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-except ImportError:
-    sys.exit("Missing dependency: matplotlib\n"
-             "  Termux:  pkg install python-numpy python-matplotlib")
-
-try:
-    from reportlab.lib.pagesizes import letter
+    from reportlab.graphics.shapes import Drawing, Rect
+    from reportlab.graphics.shapes import String as DStr
     from reportlab.lib import colors
-    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                    Image, Table, TableStyle, HRFlowable)
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import (Paragraph, SimpleDocTemplate, Spacer,
+                                    Table, TableStyle)
 except ImportError:
     sys.exit("Missing dependency: reportlab\n"
              "  Termux:  pip install reportlab")
@@ -39,6 +43,18 @@ except ImportError:
     HAVE_DNS = False
 
 try:
+    import certifi
+    CAFILE = certifi.where()
+except ImportError:
+    CAFILE = None
+
+try:
+    from cryptography import x509
+    HAVE_CRYPTO = True
+except ImportError:
+    HAVE_CRYPTO = False
+
+try:
     import urllib3
     urllib3.disable_warnings()
 except Exception:
@@ -46,7 +62,7 @@ except Exception:
 
 
 def _esc(s):
-    """Escape target-controlled strings before feeding ReportLab Paragraph."""
+    """Escape target-controlled strings before feeding ReportLab."""
     if s is None:
         return ''
     return (str(s).replace('&', '&amp;')
@@ -55,11 +71,7 @@ def _esc(s):
 
 
 def _default_out_dir():
-    """Where to drop the PDF.
-
-    On Termux this is shared storage only once `termux-setup-storage` has
-    been run; otherwise $HOME is used so no phantom storage tree is created.
-    """
+    """Report folder: shared storage only after `termux-setup-storage`."""
     home = os.path.expanduser('~')
     shared = os.path.join(home, 'storage', 'shared')
     if os.path.isdir(shared):
@@ -67,13 +79,27 @@ def _default_out_dir():
     return os.path.join(home, 'sitest')
 
 
-HEADER_WEIGHTS = {
-    'Strict-Transport-Security': 10,
-    'Content-Security-Policy': 12,
+# Response headers that matter, weighted by real-world impact.
+SECURITY_HEADERS = {
+    'Strict-Transport-Security': 12,
+    'Content-Security-Policy': 14,
     'X-Frame-Options': 8,
-    'X-Content-Type-Options': 5,
-    'Referrer-Policy': 5,
-    'Permissions-Policy': 3,
+    'X-Content-Type-Options': 6,
+    'Referrer-Policy': 6,
+    'Permissions-Policy': 5,
+    'Cross-Origin-Opener-Policy': 4,
+    'Cross-Origin-Resource-Policy': 3,
+}
+HEADER_MAX = float(sum(SECURITY_HEADERS.values()))
+SHORT_HEADER = {
+    'Strict-Transport-Security': 'HSTS',
+    'Content-Security-Policy': 'CSP',
+    'X-Frame-Options': 'X-Frame',
+    'X-Content-Type-Options': 'X-CTO',
+    'Referrer-Policy': 'Referrer',
+    'Permissions-Policy': 'Perms',
+    'Cross-Origin-Opener-Policy': 'COOP',
+    'Cross-Origin-Resource-Policy': 'CORP',
 }
 
 SENSITIVE_PATHS = [
@@ -88,27 +114,38 @@ SUBDOMAIN_WORDLIST = [
     'git', 'blog',
 ]
 
+PORTS = [21, 22, 80, 443, 3306, 8080]
+PORT_NAMES = {21: 'FTP', 22: 'SSH', 80: 'HTTP', 443: 'HTTPS',
+              3306: 'MySQL', 8080: 'HTTP-alt'}
+
 UA_POOL = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
     '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0',
 ]
 
-CLR = {'r': "\033[0m", 'b': "\033[1m", 'red': "\033[91m",
-       'g': "\033[92m", 'y': "\033[93m", 'c': "\033[96m"}
+SEV_COLOR = {'CRITICAL': '#dc2626', 'HIGH': '#ea580c',
+             'MEDIUM': '#d97706', 'LOW': '#0891b2', 'INFO': '#64748b'}
+SEV_RANK = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3, 'INFO': 4}
 
 
 class SiteAuditor:
-    def __init__(self, target_url):
-        if not target_url.startswith(('http://', 'https://')):
-            target_url = 'https://' + target_url
-        self.url = target_url.rstrip('/')
+    def __init__(self, target):
+        if not target.startswith(('http://', 'https://')):
+            target = 'https://' + target
+        self.url = target.rstrip('/')
         self.parsed = urlparse(self.url)
-        self.domain = (self.parsed.netloc or self.parsed.path).split(':')[0]
+        self.scheme = self.parsed.scheme
+        self.domain = (self.parsed.hostname or self.parsed.path).strip()
+        self.port = self.parsed.port or (443 if self.scheme == 'https' else 80)
         self.ip = self._resolve_ip()
         self.session = requests.Session()
-        self.session.verify = False
         self.session.headers.update({'User-Agent': UA_POOL[0]})
+        # A scanner must still reach hosts with expired or self-signed
+        # certificates so it can report on them; chain trust is assessed
+        # separately in check_tls(). Verification here would turn such a
+        # target into a blank "unreachable" report.
+        self.session.verify = False
         self.results = {}
 
     def _resolve_ip(self):
@@ -125,39 +162,42 @@ class SiteAuditor:
         except Exception:
             return None
 
-    # ---------- headers ----------
-    def audit_headers_and_speed(self):
-        print(f"[+] Headers & latency: {self.domain}")
-        t0 = time.time()
-        r = self._get(self.url, timeout=10)
+    # ------------------------------------------------------- homepage -----
+    def fetch_homepage(self):
+        print(f"[+] Fetching {self.url}")
+        t0 = time.perf_counter()
+        r = self._get(self.url, timeout=12)
+        total = round((time.perf_counter() - t0) * 1000, 1)
         if r is None:
-            return {'status': 'Error', 'latency': 0, 'sec_headers': {},
-                    'server': 'Unknown', 'error': 'unreachable',
-                    'set_cookie_raw': [], 'powered_by': None,
-                    'cf_ray': None, 'html': ''}
-        latency = round((time.time() - t0) * 1000, 2)
-        h = r.headers
-        sec = {k: (k in h) for k in HEADER_WEIGHTS}
+            return {'ok': False, 'status': 'Error', 'elapsed_ms': total,
+                    'ttfb_ms': None, 'server': 'Unknown', 'sec_headers': {},
+                    'html': '', 'size_kb': 0, 'encoding': None,
+                    'powered_by': None, 'xss_protection': None,
+                    'cf_ray': None, 'set_cookie_raw': []}
         try:
-            html = r.text[:200000]
+            html = r.text[:300000]
         except Exception:
             html = ''
         return {
+            'ok': r.status_code < 400,
             'status': r.status_code,
-            'latency': latency,
-            'sec_headers': sec,
-            'server': h.get('Server', 'Hidden'),
-            'powered_by': h.get('X-Powered-By'),
-            'cf_ray': h.get('CF-RAY'),
-            'cors': h.get('Access-Control-Allow-Origin', 'Not Set'),
+            'elapsed_ms': total,
+            'ttfb_ms': round(r.elapsed.total_seconds() * 1000, 1),
+            'server': r.headers.get('Server', 'Hidden'),
+            'sec_headers': {k: (k in r.headers) for k in SECURITY_HEADERS},
+            'html': html,
+            'size_kb': round(len(r.content) / 1024, 1),
+            'encoding': r.headers.get('Content-Encoding'),
+            'powered_by': r.headers.get('X-Powered-By'),
+            'xss_protection': r.headers.get('X-XSS-Protection'),
+            'cf_ray': r.headers.get('CF-RAY'),
             'set_cookie_raw': (
                 r.raw.headers.getlist('Set-Cookie')
                 if hasattr(r.raw.headers, 'getlist') else []
             ),
-            'html': html,
         }
 
-    # ---------- sensitive files ----------
+    # ----------------------------------------------------- sensitive ------
     def check_sensitive_files(self):
         print("[+] Sensitive file probe (baseline + magic-byte verified)")
         ua = UA_POOL[1]
@@ -181,13 +221,10 @@ class SiteAuditor:
             if any(s in body for s in
                    ('not found', '404', 'cannot get', 'page not found')):
                 return None
-            # Byte-level validation: an HTML / soft-404 payload is not a
-            # leak, so it must never populate exposed_files.
+            # Byte-level validation: an HTML / soft-404 page is not a leak.
             signature = self._detect_signature(r.content, path, ct)
             if signature is None:
                 return None
-            # Capture the signature and a redacted sample once, here, so the
-            # evidence table reuses them instead of fetching the file again.
             return {
                 'path': path,
                 'url': self.url + path,
@@ -202,19 +239,19 @@ class SiteAuditor:
         with cf.ThreadPoolExecutor(max_workers=6) as ex:
             return [x for x in ex.map(probe, SENSITIVE_PATHS) if x]
 
-    # ---------- evidence ----------
+    # -------------------------------------------------------- evidence ----
     def _detect_signature(self, buf, path, ctype=''):
         """Byte-accurate content ID.
 
-        Magic bytes are checked first; HTML/soft-404 responses return
-        None so they can never be reported as a data leak.
+        Magic bytes are checked first; HTML/soft-404 responses return None so
+        they can never be reported as a data leak.
         """
         if buf is None or len(buf) < 4:
             return None
         head = buf[:512]
         low = head.lower()
 
-        # 1) magic bytes — authoritative, checked before any heuristic.
+        # 1) magic bytes -- authoritative, before any heuristic.
         if buf[:2] == b'PK':
             return 'ZIP archive (backup bundle)'
         if buf[:3] == b'\x1f\x8b\x08':
@@ -226,7 +263,7 @@ class SiteAuditor:
         if buf[:2] == b'MZ':
             return 'Windows executable'
         if head.startswith(b'ref:'):
-            return 'Git HEAD — repository exposed'
+            return 'Git HEAD -- repository exposed'
         if buf[:4] == b'SQL\x00' or buf[:9] == b'-- MySQL ':
             return 'MySQL dump'
         if buf[:5] == b'PGDMP':
@@ -234,7 +271,7 @@ class SiteAuditor:
         if b'<?php' in head[:200]:
             return 'PHP source code'
 
-        # 2) HTML / soft-404 pages are not leaks — explicitly excluded.
+        # 2) HTML / soft-404 pages are not leaks -- explicitly excluded.
         if 'text/html' in (ctype or '').lower():
             return None
         if (b'<html' in low or b'<!doctype' in low
@@ -257,10 +294,7 @@ class SiteAuditor:
     def _sanitize_sample(self, buf, path):
         if buf is None:
             return ''
-        try:
-            text = buf.decode('utf-8', errors='replace')
-        except Exception:
-            return buf[:40].hex()
+        text = buf.decode('utf-8', errors='replace')
 
         if '.env' in path or (b'=' in buf[:80] and b'\n' in buf[:150]):
             lines = []
@@ -292,10 +326,10 @@ class SiteAuditor:
         return text[:80]
 
     def extract_evidence(self):
-        """Build the evidence table from the signatures captured during
-        check_sensitive_files. No second fetch: the evidence is derived from
-        the same bytes that were validated during the probe, so it can never
-        contradict exposed_files.
+        """Build the evidence table from the signatures the probe captured.
+
+        No second fetch: evidence derives from the same bytes that were
+        validated, so it can never contradict exposed_files.
         """
         print("[+] Building evidence from probe signatures")
         evidence = []
@@ -313,7 +347,7 @@ class SiteAuditor:
             })
         return evidence
 
-    # ---------- attack surface ----------
+    # --------------------------------------------------- attack surface ---
     def check_subdomains(self):
         print("[+] Subdomain enumeration")
         found = []
@@ -321,8 +355,7 @@ class SiteAuditor:
         def check(sub):
             host = f"{sub}.{self.domain}"
             try:
-                ip = socket.gethostbyname(host)
-                return (sub, host, ip)
+                return (sub, host, socket.gethostbyname(host))
             except Exception:
                 return None
 
@@ -336,12 +369,11 @@ class SiteAuditor:
         r = self._get(self.url + '/robots.txt', timeout=5)
         if r is None or r.status_code != 200:
             return {'found': False, 'sensitive': []}
-        text = r.text[:5000]
         sensitive = []
         keywords = ['admin', 'backup', 'config', 'private', 'internal',
                     'db', 'sql', 'staging', 'dev', 'test', 'api/',
                     'secret', 'key', 'token']
-        for line in text.split('\n'):
+        for line in r.text[:5000].split('\n'):
             line = line.strip()
             if line.lower().startswith(('disallow', 'allow')):
                 p = line.split(':', 1)[-1].strip()
@@ -349,8 +381,45 @@ class SiteAuditor:
                     sensitive.append(p)
         return {'found': True, 'sensitive': sensitive[:8]}
 
+    def check_sitemap(self):
+        r = self._get(self.url + '/sitemap.xml', timeout=6)
+        if r is None or r.status_code != 200:
+            return {'found': False, 'urls': 0}
+        return {'found': True, 'urls': len(re.findall(r'<loc>', r.text[:200000]))}
+
+    def check_security_txt(self):
+        for path in ('/.well-known/security.txt', '/security.txt'):
+            r = self._get(self.url + path, timeout=5)
+            if (r is not None and r.status_code == 200
+                    and 'contact' in r.text.lower()[:2000]):
+                return {'found': True, 'path': path}
+        return {'found': False}
+
+    def check_http_methods(self):
+        print("[+] HTTP methods")
+        try:
+            r = self.session.options(self.url, timeout=6,
+                                     allow_redirects=False)
+            allow = r.headers.get('Allow', '')
+        except Exception:
+            allow = ''
+        methods = [m.strip().upper() for m in allow.split(',') if m.strip()]
+        return {'allow': methods, 'trace': 'TRACE' in methods}
+
+    def check_mixed_content(self):
+        if self.scheme != 'https':
+            return []
+        html = self.results.get('home', {}).get('html', '')
+        hits = set()
+        for m in re.finditer(r'''(?:src|href)\s*=\s*["']http://([^"'/]+)''',
+                            html, re.I):
+            host = m.group(1).lower()
+            if self.domain not in host:
+                hits.add(host)
+        return sorted(hits)[:4]
+
     def extract_emails(self):
-        html = self.results.get('header_speed', {}).get('html', '')
+        html = self.results.get('home', {}).get('html', '')
         if not html:
             return []
         emails = set(re.findall(
@@ -362,32 +431,29 @@ class SiteAuditor:
 
     def extract_versions(self):
         out = {}
-        hs = self.results.get('header_speed', {})
+        hs = self.results.get('home', {})
         srv = hs.get('server', '')
         if srv and re.search(r'\d', srv) and srv.lower() not in (
                 'hidden', 'unknown'):
             out['Server'] = srv[:40]
-        pb = hs.get('powered_by')
-        if pb:
-            out['X-Powered-By'] = pb[:40]
+        if hs.get('powered_by'):
+            out['X-Powered-By'] = hs['powered_by'][:40]
         html = hs.get('html', '')
-        m = re.search(
-            r'<meta name="generator" content="WordPress ([\d.]+)"', html)
-        if m:
-            out['WordPress'] = m.group(1)
-        m = re.search(r'jquery[/-]([\d.]+)(?:\.min)?\.js', html)
-        if m:
-            out['jQuery'] = m.group(1)
-        m = re.search(r'bootstrap[/-]v?([\d.]+)', html)
-        if m:
-            out['Bootstrap'] = m.group(1)
+        for label, pat in (
+                ('WordPress', r'<meta name="generator" content="WordPress '
+                              r'([\d.]+)"'),
+                ('jQuery', r'jquery[/-]([\d.]+)(?:\.min)?\.js'),
+                ('Bootstrap', r'bootstrap[/-]v?([\d.]+)')):
+            m = re.search(pat, html)
+            if m:
+                out[label] = m.group(1)
         return out
 
-    # ---------- ports ----------
-    def is_behind_cdn(self, hs):
-        if hs.get('cf_ray'):
+    # ---------------------------------------------------------- ports -----
+    def is_behind_cdn(self, home):
+        if home.get('cf_ray'):
             return 'Cloudflare'
-        srv = (hs.get('server') or '').lower()
+        srv = (home.get('server') or '').lower()
         for kw, name in (('cloudflare', 'Cloudflare'),
                          ('cloudfront', 'CloudFront'),
                          ('akamai', 'Akamai'),
@@ -402,7 +468,7 @@ class SiteAuditor:
 
     def _probe_port(self, port):
         """TCP connect state: 0 => Open, ECONNREFUSED (111) => Closed,
-        any other error/timeout => Filtered."""
+        anything else (timeout/filtered) => Filtered."""
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(2.0)
         try:
@@ -422,59 +488,127 @@ class SiteAuditor:
             print("[+] Port scan skipped (behind CDN)")
             return {}
         print("[+] Port scan (TCP connect state)")
-        ports = [21, 22, 80, 443, 3306, 8080]
         if self.ip == "Unknown":
             return {}
         with cf.ThreadPoolExecutor(max_workers=6) as ex:
-            return dict(ex.map(self._probe_port, ports))
+            return dict(ex.map(self._probe_port, PORTS))
 
-    # ---------- ssl ----------
-    def check_ssl(self):
-        if not self.url.startswith('https'):
-            return {'enabled': False}
+    # ------------------------------------------------------------ TLS -----
+    def _tls_context(self, verify):
+        if verify:
+            return (ssl.create_default_context(cafile=CAFILE) if CAFILE
+                    else ssl.create_default_context())
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _cert_from_dict(self, info, cert):
         try:
-            # Only the presented certificate is read (issuer / expiry), so an
-            # unverified context is deliberate: Termux frequently ships no CA
-            # bundle, which would otherwise fail every HTTPS check.
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            with socket.create_connection((self.domain, 443), timeout=6) as s:
-                with ctx.wrap_socket(s, server_hostname=self.domain) as ss:
-                    cert = ss.getpeercert()
-                    proto = ss.version()
-            exp = datetime.strptime(
-                cert['notAfter'], '%b %d %H:%M:%S %Y %Z'
-            ).replace(tzinfo=timezone.utc)
-            days = (exp - datetime.now(timezone.utc)).days
-            issuer = dict(x[0] for x in cert['issuer']).get(
-                'organizationName', 'Unknown')
-            return {'enabled': True, 'issuer': issuer, 'protocol': proto,
-                    'expires': exp.strftime('%Y-%m-%d'), 'days_left': days,
-                    'expired': days < 0, 'expiring_soon': 0 <= days < 30}
-        except Exception as e:
-            return {'enabled': True, 'error': str(e)[:60]}
+            exp = datetime.strptime(cert['notAfter'],
+                                    '%b %d %H:%M:%S %Y %Z'
+                                    ).replace(tzinfo=timezone.utc)
+            info['days_left'] = (exp - datetime.now(timezone.utc)).days
+            info['expires'] = exp.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+        try:
+            info['issuer'] = dict(x[0] for x in cert['issuer']
+                                  ).get('organizationName', '?')
+            info['subject'] = dict(x[0] for x in cert['subject']
+                                   ).get('commonName', self.domain)
+            info['san_count'] = len(cert.get('subjectAltName', []))
+        except Exception:
+            pass
 
-    # ---------- email ----------
+    def _cert_from_der(self, info, der):
+        try:
+            c = x509.load_der_x509_certificate(der)
+            oid = x509.oid.NameOID
+            org = c.issuer.get_attributes_for_oid(oid.ORGANIZATION_NAME)
+            cn = c.subject.get_attributes_for_oid(oid.COMMON_NAME)
+            info['issuer'] = org[0].value if org else '?'
+            info['subject'] = cn[0].value if cn else self.domain
+            exp = getattr(c, 'not_valid_after_utc', None)
+            if exp is None:
+                exp = c.not_valid_after.replace(tzinfo=timezone.utc)
+            info['days_left'] = (exp - datetime.now(timezone.utc)).days
+            info['expires'] = exp.strftime('%Y-%m-%d')
+            try:
+                san = c.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName).value
+                info['san_count'] = len(list(san))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def check_tls(self):
+        if self.scheme != 'https':
+            return {'enabled': False}
+        info = {'enabled': True, 'verified': False, 'issuer': '?',
+                'subject': self.domain, 'days_left': None, 'expires': None,
+                'protocol': None, 'cipher': None, 'alpn': None,
+                'san_count': None}
+        for verify in (True, False):
+            try:
+                ctx = self._tls_context(verify)
+                try:
+                    ctx.set_alpn_protocols(['h2', 'http/1.1'])
+                except NotImplementedError:
+                    pass
+                with socket.create_connection((self.domain, self.port),
+                                              timeout=8) as sock:
+                    with ctx.wrap_socket(sock,
+                                         server_hostname=self.domain) as ss:
+                        cert = ss.getpeercert()
+                        der = ss.getpeercert(binary_form=True)
+                        info['protocol'] = ss.version()
+                        info['alpn'] = ss.selected_alpn_protocol()
+                        cipher = ss.cipher()
+                        if cipher:
+                            info['cipher'] = '%s (%s-bit)' % (cipher[0],
+                                                              cipher[2])
+                info['verified'] = bool(cert)
+                if cert:
+                    self._cert_from_dict(info, cert)
+                elif der and HAVE_CRYPTO:
+                    self._cert_from_der(info, der)
+                return info
+            except ssl.SSLCertVerificationError:
+                continue
+            except Exception as exc:
+                info['error'] = str(exc)[:70]
+        return info
+
+    # ---------------------------------------------------------- email -----
     def check_email_security(self):
-        out = {'spf': None, 'dmarc': None, 'mx': None,
+        out = {'spf': None, 'spf_policy': None, 'dmarc': None,
+               'dmarc_policy': None, 'mx': None, 'caa': None,
                'dns_available': HAVE_DNS}
         if not HAVE_DNS:
             return out
         try:
-            for r in dns.resolver.resolve(self.domain, 'TXT', lifetime=6):
-                t = r.to_text().strip('"')
+            for rec in dns.resolver.resolve(self.domain, 'TXT', lifetime=6):
+                t = rec.to_text().strip('"')
                 if t.startswith('v=spf1'):
                     out['spf'] = t
+                    m = re.search(r'([-~+?])all\b', t)
+                    if m:
+                        out['spf_policy'] = m.group(1) + 'all'
                     break
         except Exception:
             pass
         try:
-            for r in dns.resolver.resolve('_dmarc.' + self.domain,
-                                          'TXT', lifetime=6):
-                t = r.to_text().strip('"')
+            for rec in dns.resolver.resolve('_dmarc.' + self.domain,
+                                            'TXT', lifetime=6):
+                t = rec.to_text().strip('"')
                 if t.startswith('v=DMARC1'):
                     out['dmarc'] = t
+                    m = re.search(r'\bp\s*=\s*(none|quarantine|reject)',
+                                  t, re.I)
+                    if m:
+                        out['dmarc_policy'] = m.group(1).lower()
                     break
         except Exception:
             pass
@@ -482,6 +616,12 @@ class SiteAuditor:
             out['mx'] = [str(r.exchange).rstrip('.')
                          for r in dns.resolver.resolve(self.domain, 'MX',
                                                        lifetime=6)]
+        except Exception:
+            pass
+        try:
+            out['caa'] = [r.to_text()[:70]
+                          for r in dns.resolver.resolve(self.domain, 'CAA',
+                                                        lifetime=6)]
         except Exception:
             pass
         return out
@@ -505,6 +645,8 @@ class SiteAuditor:
                 'name': name,
                 'secure': 'secure' in rest,
                 'httponly': 'httponly' in rest,
+                'prefixed': name.startswith('__Host-')
+                or name.startswith('__Secure-'),
                 'samesite': ('none' if 'samesite=none' in rest
                              else 'lax' if 'samesite=lax' in rest
                              else 'strict' if 'samesite=strict' in rest
@@ -512,731 +654,573 @@ class SiteAuditor:
             })
         return out
 
-    # ---------- score ----------
+    # -------------------------------------------------------- findings ----
+    def build_findings(self):
+        r = self.results
+        tls = r.get('tls', {})
+        em = r.get('email', {})
+        home = r.get('home', {})
+        out = []
+
+        for ef in r.get('exposed_files', []):
+            out.append(('CRITICAL',
+                        f"Public {ef['signature']} at {ef['path']}",
+                        f"{ef['size']} bytes readable without auth"))
+        if '3306' in r.get('open_ports', []):
+            out.append(('CRITICAL', 'MySQL port 3306 reachable',
+                        'internet-facing database; brute force possible'))
+        if '21' in r.get('open_ports', []):
+            out.append(('HIGH', 'FTP port 21 open',
+                        'plaintext credentials if used'))
+        if tls.get('days_left') is not None and tls['days_left'] < 0:
+            out.append(('CRITICAL', 'TLS certificate expired',
+                        f"{abs(tls['days_left'])} days ago"))
+        elif tls.get('days_left') is not None and tls['days_left'] < 15:
+            out.append(('HIGH', 'TLS certificate expiring',
+                        f"{tls['days_left']} days left"))
+        if tls.get('enabled') and tls.get('protocol') in ('TLSv1', 'TLSv1.1',
+                                                          'SSLv3'):
+            out.append(('HIGH', 'Obsolete TLS version',
+                        f"negotiates {tls['protocol']}"))
+        if tls.get('error'):
+            out.append(('HIGH', 'TLS handshake failed',
+                        str(tls['error'])[:70]))
+        if em.get('dns_available') and not em.get('dmarc'):
+            out.append(('HIGH', 'No DMARC record',
+                        'anyone can spoof mail from this domain'))
+        elif em.get('dmarc_policy') == 'none':
+            out.append(('MEDIUM', 'DMARC policy is p=none',
+                        'monitoring only; spoofed mail still delivers'))
+        h = home.get('sec_headers', {})
+        for key in ('Content-Security-Policy', 'Strict-Transport-Security'):
+            if h.get(key) is False:
+                out.append(('HIGH', f"Missing {SHORT_HEADER[key]}",
+                            'no defence against injection / downgrade'))
+        other = [SHORT_HEADER[k] for k in SECURITY_HEADERS
+                 if h.get(k) is False and k not in
+                 ('Content-Security-Policy', 'Strict-Transport-Security')]
+        if other:
+            out.append(('MEDIUM', 'Missing security headers',
+                        ', '.join(other)))
+        if em.get('dns_available') and not em.get('spf'):
+            out.append(('MEDIUM', 'No SPF record', 'sender forgery possible'))
+        if r.get('https_redirect') is False:
+            out.append(('MEDIUM', 'No HTTP-to-HTTPS redirect',
+                        'plaintext traffic not upgraded'))
+        if r.get('mixed_content'):
+            out.append(('MEDIUM', 'Mixed content on HTTPS page',
+                        ', '.join(r['mixed_content'][:3])))
+        if r.get('methods', {}).get('trace'):
+            out.append(('MEDIUM', 'HTTP TRACE enabled',
+                        'cross-site tracing / XST risk'))
+        for probe in r.get('exposed_ports_extra', []):
+            out.append(('MEDIUM', f"Unexpected service on port {probe}",
+                        PORT_NAMES.get(probe, 'unknown service')))
+        if r.get('versions'):
+            out.append(('LOW', 'Software versions disclosed',
+                        ', '.join(f"{k} {v}"
+                                  for k, v in list(r['versions'].items())[:3])))
+        if home.get('sec_headers') and not home.get('encoding'):
+            out.append(('LOW', 'No HTTP compression',
+                        'reported payload sent uncompressed'))
+        if r.get('security_txt', {}).get('found') is False:
+            out.append(('LOW', 'No security.txt',
+                        'no published vulnerability contact'))
+        out.sort(key=lambda f: SEV_RANK.get(f[0], 9))
+        return out
+
+    # ----------------------------------------------------------- score ----
     def calculate_score(self):
         r = self.results
-        score = 0
-        for h, w in HEADER_WEIGHTS.items():
-            if r['header_speed']['sec_headers'].get(h):
-                score += w
-        if self.url.startswith('https') or r.get('https_redirect'):
-            score += 10
-        ssl_info = r.get('ssl', {})
-        if (ssl_info.get('enabled') and not ssl_info.get('expired')
-                and not ssl_info.get('error')):
-            score += 20
+        earned = 0.0
+        h = r.get('home', {}).get('sec_headers', {})
+        got = sum(w for k, w in SECURITY_HEADERS.items() if h.get(k))
+        earned += 45.0 * got / HEADER_MAX
+
+        tls = r.get('tls', {})
+        if tls.get('enabled') and not tls.get('error'):
+            d = tls.get('days_left')
+            if d is None:
+                earned += 12.0
+            elif d < 0:
+                earned += 0.0
+            elif d < 15:
+                earned += 8.0
+            else:
+                earned += 20.0
+        if r.get('https_redirect'):
+            earned += 5.0
         em = r.get('email', {})
         if em.get('spf'):
-            score += 5
+            earned += 5.0
         if em.get('dmarc'):
-            score += 7
+            earned += 7.0
         if not r.get('exposed_files'):
-            score += 8
-        crit = [p for p in r.get('open_ports', []) if p in ('21', '3306')]
-        if not crit:
-            score += 7
-        return max(int(score), 5)
+            earned += 8.0
+        if not [p for p in r.get('open_ports', []) if p in ('21', '3306')]:
+            earned += 6.0
+        if not r.get('mixed_content'):
+            earned += 4.0
+        return max(0, min(100, int(round(earned))))
 
-    # ---------- orchestrate ----------
+    @staticmethod
+    def grade(score):
+        for cut, g in ((90, 'A'), (80, 'B'), (70, 'C'), (60, 'D'),
+                       (50, 'E')):
+            if score >= cut:
+                return g
+        return 'F'
+
+    # ------------------------------------------------------ orchestrate ---
     def run_audit(self):
-        self.results['header_speed'] = self.audit_headers_and_speed()
-        hs = self.results['header_speed']
-        cdn = self.is_behind_cdn(hs)
+        self.results['home'] = self.fetch_homepage()
+        home = self.results['home']
+        cdn = self.is_behind_cdn(home)
         self.results['cdn'] = cdn
 
         with cf.ThreadPoolExecutor(max_workers=6) as ex:
-            f_files = ex.submit(self.check_sensitive_files)
-            f_ssl = ex.submit(self.check_ssl)
-            f_email = ex.submit(self.check_email_security)
-            f_redir = ex.submit(self.check_https_redirect)
-            f_sub = ex.submit(self.check_subdomains)
-            f_robots = ex.submit(self.extract_robots)
-            self.results['exposed_files'] = f_files.result()
-            self.results['ssl'] = f_ssl.result()
-            self.results['email'] = f_email.result()
-            self.results['https_redirect'] = f_redir.result()
-            self.results['subdomains'] = f_sub.result()
-            self.results['robots'] = f_robots.result()
+            jobs = {
+                'exposed_files': ex.submit(self.check_sensitive_files),
+                'tls': ex.submit(self.check_tls),
+                'email': ex.submit(self.check_email_security),
+                'https_redirect': ex.submit(self.check_https_redirect),
+                'subdomains': ex.submit(self.check_subdomains),
+                'robots': ex.submit(self.extract_robots),
+                'sitemap': ex.submit(self.check_sitemap),
+                'security_txt': ex.submit(self.check_security_txt),
+                'methods': ex.submit(self.check_http_methods),
+            }
+            for key, job in jobs.items():
+                self.results[key] = job.result()
 
         self.results['ports'] = self.check_ports(skip=bool(cdn))
         self.results['open_ports'] = [str(p) for p, s in
                                       self.results['ports'].items()
                                       if s == 'Open']
+        self.results['exposed_ports_extra'] = [
+            int(p) for p in self.results['open_ports']
+            if int(p) not in (80, 443) and int(p) not in (21, 3306)]
         self.results['cookies'] = self.parse_cookie_flags(
-            hs.get('set_cookie_raw', []))
+            home.get('set_cookie_raw', []))
 
         self.results['evidence'] = self.extract_evidence()
         self.results['emails'] = self.extract_emails()
         self.results['versions'] = self.extract_versions()
+        self.results['mixed_content'] = self.check_mixed_content()
 
-        passed = sum(1 for v in hs.get('sec_headers', {}).values() if v)
-        total = len(HEADER_WEIGHTS)
+        passed = sum(1 for v in home.get('sec_headers', {}).values() if v)
+        total = len(SECURITY_HEADERS)
         self.results.update({
             'domain': self.domain, 'ip': self.ip,
             'passed_headers': passed, 'total_headers': total,
             'audit_date': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'tool': 'SiteAuditor v3.0',
         })
+        self.results['findings'] = self.build_findings()
         self.results['security_score'] = self.calculate_score()
+        self.results['grade'] = self.grade(self.results['security_score'])
 
-    # ---------- charts ----------
-    def generate_charts(self):
-        path = os.path.join(tempfile.gettempdir(), 'audit_chart.png')
-        fig, (ax1, ax2) = plt.subplots(
-            1, 2, figsize=(7.4, 1.75),
-            gridspec_kw={'width_ratios': [1.7, 1]})
-        hs = self.results['header_speed'].get('sec_headers', {})
-        labels_short = ['HSTS', 'CSP', 'X-Frame', 'X-Cont',
-                        'Referrer', 'Perm']
-        heights, cols = [], []
-        for name in HEADER_WEIGHTS:
-            w = HEADER_WEIGHTS[name]
-            if hs.get(name):
-                heights.append(8)
-                cols.append('#2ecc71')
+    # ----------------------------------------------------- charts ---------
+    @staticmethod
+    def _bars(rows, width, height, label_w=70, value_w=30):
+        """rows: (label, ratio 0..1, colour, value_text)."""
+        d = Drawing(width, height)
+        n = max(len(rows), 1)
+        row_h = height / n
+        bar_x = label_w
+        bar_w = max(10.0, width - label_w - value_w)
+        for i, (label, ratio, col, text) in enumerate(rows):
+            y = height - (i + 1) * row_h + row_h * 0.28
+            bh = max(4.5, row_h * 0.46)
+            c = colors.HexColor(col)
+            d.add(DStr(0, y + 1.4, label, fontName='Helvetica', fontSize=6.3,
+                       fillColor=colors.HexColor('#334155')))
+            d.add(Rect(bar_x, y, bar_w, bh,
+                       fillColor=colors.HexColor('#eef2f7'),
+                       strokeColor=colors.HexColor('#eef2f7')))
+            d.add(Rect(bar_x, y, max(1.5, bar_w * ratio), bh,
+                       fillColor=c, strokeColor=c))
+            d.add(DStr(bar_x + bar_w + 3, y + 1.4, text,
+                       fontName='Helvetica-Bold', fontSize=6.3,
+                       fillColor=c))
+        return d
+
+    def header_matrix_chart(self, width=300):
+        h = self.results['home'].get('sec_headers', {})
+        rows = []
+        for key in SECURITY_HEADERS:
+            ok = bool(h.get(key))
+            rows.append((SHORT_HEADER[key], 1.0 if ok else 0.34,
+                         '#16a34a' if ok else '#dc2626',
+                         'OK' if ok else 'MISS'))
+        return self._bars(rows, width, 9.5 * len(rows) + 4)
+
+    def risk_chart(self, width=300):
+        f = self.results.get('findings', [])
+        weights = {'CRITICAL': 34, 'HIGH': 18, 'MEDIUM': 9, 'LOW': 3}
+        # Ordered: first matching group wins, last group is the fallback.
+        groups = [
+            ('Client-side', ('mixed', 'csp', 'frame', 'security headers',
+                             'cookie', 'trace', 'referrer', 'permissions')),
+            ('Transport / TLS', ('tls', 'https', 'hsts', 'redirect')),
+            ('Email spoofing', ('dmarc', 'spf', 'mail')),
+            ('Data exposure', ('leak', 'public', 'json', 'zip', 'git',
+                               'config', 'sql', 'dump')),
+        ]
+        buckets = {name: 0 for name, _ in groups}
+        buckets['Infrastructure'] = 0
+        for sev, title, _ in f:
+            w = weights.get(sev, 1)
+            t = title.lower()
+            for name, keys in groups:
+                if any(k in t for k in keys):
+                    buckets[name] += w
+                    break
             else:
-                heights.append(w)
-                cols.append('#e74c3c' if w >= 10 else
-                             '#f39c12' if w >= 5 else '#f1c40f')
-        bars = ax1.bar(labels_short, heights, color=cols, width=0.55,
-                       edgecolor='#2c3e50', linewidth=0.4)
-        ax1.set_ylim(0, max(heights) * 1.35 if heights else 15)
-        ax1.set_yticks([])
-        ax1.tick_params(axis='x', labelsize=6.5)
-        for sp in ('top', 'right', 'left'):
-            ax1.spines[sp].set_visible(False)
-        ax1.set_title("Security Header Matrix",
-                      fontsize=7.5, fontweight='bold', pad=6)
-        for b, name in zip(bars, HEADER_WEIGHTS):
-            ok = hs.get(name, False)
-            ax1.text(b.get_x() + b.get_width() / 2,
-                     b.get_height() + (max(heights) if heights else 1) * 0.04,
-                     'OK' if ok else 'MISS',
-                     ha='center', va='bottom', fontsize=5.5,
-                     fontweight='bold',
-                     color='#27ae60' if ok else b.get_facecolor())
+                buckets['Infrastructure'] += w
+        rows = []
+        for name in [n for n, _ in groups] + ['Infrastructure']:
+            pct = min(buckets.get(name, 0), 100)
+            col = ('#dc2626' if pct >= 60 else
+                   '#ea580c' if pct >= 35 else
+                   '#16a34a' if pct <= 15 else '#d97706')
+            rows.append((name, max(pct, 3) / 100.0, col, f"{pct}%"))
+        return self._bars(rows, width, 9.5 * len(rows) + 4, label_w=88)
 
-        score = self.results['security_score']
-        sc = ('#2ecc71' if score >= 75 else
-              '#f39c12' if score >= 50 else '#e74c3c')
-        ax2.pie([score, max(100 - score, 0)], colors=[sc, '#ecf0f1'],
-                startangle=90, counterclock=False,
-                wedgeprops=dict(width=0.38, edgecolor='white',
-                                linewidth=1.5))
-        ax2.text(0, 0, f"{score}", ha='center', va='center',
-                 fontsize=15, fontweight='bold', color=sc)
-        ax2.text(0, -0.32, "/100", ha='center', va='center',
-                 fontsize=7, color='#7f8c8d')
-        ax2.set_title("Security Score", fontsize=7.5,
-                      fontweight='bold', pad=6)
-        plt.tight_layout(pad=0.4)
-        plt.savefig(path, dpi=220, bbox_inches='tight', facecolor='white')
-        plt.close(fig)
-        return path
-
-    def generate_risk_chart(self):
-        path = os.path.join(tempfile.gettempdir(), 'risk_chart.png')
-        opens = self.results.get('open_ports', [])
-        em = self.results.get('email', {})
-        ssl_info = self.results.get('ssl', {})
-
-        net = 20
-        if '3306' in opens:
-            net += 55
-        if any(p in opens for p in ('21', '22')):
-            net += 20
-        net = min(net, 95)
-
-        data = 15
-        data += len(self.results.get('exposed_files', [])) * 30
-        if em.get('dns_available'):
-            if not em.get('spf'):
-                data += 15
-            if not em.get('dmarc'):
-                data += 15
-        if ssl_info.get('expired') or ssl_info.get('error'):
-            data += 20
-        data = min(data, 95)
-
-        missing = (self.results['total_headers'] -
-                   self.results['passed_headers'])
-        client = min(20 + missing * 11, 95)
-
-        cats = ['Client-Side (XSS / Phishing)',
-                'Data Breach (Leaks / Email Spoofing)',
-                'Infrastructure (Ransomware / Intrusion)']
-        vals = [client, data, net]
-        cols = ['#e74c3c' if v >= 70 else
-                '#f39c12' if v >= 40 else '#2ecc71' for v in vals]
-
-        fig, ax = plt.subplots(figsize=(7.5, 0.95))
-        bars = ax.barh(cats, vals, color=cols, height=0.55,
-                       edgecolor='#2c3e50', linewidth=0.6)
-        ax.set_xlim(0, 118)
-        for sp in ('top', 'right', 'bottom'):
-            ax.spines[sp].set_visible(False)
-        ax.spines['left'].set_color('#bdc3c7')
-        ax.xaxis.set_ticks([])
-        ax.tick_params(axis='y', labelsize=7, left=False,
-                       colors='#2c3e50')
-        for b in bars:
-            w = b.get_width()
-            ax.text(w + 2.5, b.get_y() + b.get_height() / 2,
-                    f'{int(w)}%', va='center', ha='left',
-                    fontsize=7.5, fontweight='bold',
-                    color=b.get_facecolor())
-        plt.tight_layout(pad=0.3)
-        plt.savefig(path, dpi=220, bbox_inches='tight', facecolor='white')
-        plt.close(fig)
-        return path
-
-    # ---------- remediation ----------
-    def plan_remediation(self):
-        fixes = []
-        r = self.results
-        em = r.get('email', {})
-        ssl_info = r.get('ssl', {})
-        exposed = r.get('exposed_files', [])
-
-        if exposed:
-            paths = ', '.join(e['path'] for e in exposed[:2])
-            fixes.append((f"Remove public access to {paths} "
-                          "(move outside web root)", 'CRITICAL', '< 1h'))
-        if ssl_info.get('expired'):
-            fixes.append(("Renew expired SSL certificate immediately",
-                          'CRITICAL', '1-2h'))
-        elif ssl_info.get('expiring_soon'):
-            fixes.append((f"Renew SSL certificate "
-                          f"({ssl_info.get('days_left')}d left)",
-                          'HIGH', '1-2h'))
-        if em.get('dns_available') and not em.get('dmarc'):
-            fixes.append(("Publish DMARC record (v=DMARC1; p=quarantine)",
-                          'HIGH', '< 30m'))
-        if em.get('dns_available') and not em.get('spf'):
-            fixes.append(("Publish SPF record to authorize senders",
-                          'HIGH', '< 30m'))
-        hs = r['header_speed'].get('sec_headers', {})
-        missing_crit = [k for k, v in hs.items()
-                        if not v and HEADER_WEIGHTS.get(k, 0) >= 10]
-        if missing_crit:
-            names = {'Strict-Transport-Security': 'HSTS',
-                     'Content-Security-Policy': 'CSP'}
-            pretty = ', '.join(names.get(k, k) for k in missing_crit)
-            fixes.append((f"Add critical headers: {pretty}",
-                          'MEDIUM', '1-2h'))
-        if r.get('https_redirect') is False:
-            fixes.append(("Enable 301 redirect HTTP->HTTPS",
-                          'MEDIUM', '< 15m'))
-        if r.get('versions'):
-            fixes.append(("Update outdated software versions "
-                          "disclosed in headers",
-                          'MEDIUM', '1h'))
-        return fixes[:6]
-
-    # ---------- PDF ----------
+    # ---------------------------------------------------------- PDF -------
     def generate_pdf(self):
         print("[+] Generating single-page PDF report...")
-        target_folder = _default_out_dir()
+        out_dir = _default_out_dir()
         try:
-            os.makedirs(target_folder, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
         except Exception:
-            target_folder = '.'
-        pdf_path = os.path.join(target_folder, f"{self.domain}_audit.pdf")
+            out_dir = '.'
+        pdf_path = os.path.join(out_dir, f"{self.domain}_audit.pdf")
 
-        chart1 = self.generate_charts()
-        chart2 = self.generate_risk_chart()
-
-        doc = SimpleDocTemplate(
-            pdf_path, pagesize=letter,
-            rightMargin=22, leftMargin=22,
-            topMargin=14, bottomMargin=12)
+        r = self.results
+        home = r['home']
+        tls = r.get('tls', {})
+        em = r.get('email', {})
+        score = r['security_score']
+        grade = r['grade']
+        gcol = ('#16a34a' if score >= 80 else
+                '#ca8a04' if score >= 60 else '#dc2626')
 
         styles = getSampleStyleSheet()
-        TITLE = ParagraphStyle('T', parent=styles['Heading1'],
-                               fontSize=14.5,
-                               textColor=colors.HexColor('#1a252f'),
-                               spaceAfter=0, leading=16)
-        SUB = ParagraphStyle('S', parent=styles['Normal'], fontSize=7,
-                             textColor=colors.HexColor('#7f8c8d'),
-                             spaceAfter=0, leading=8.5)
-        H = ParagraphStyle('H', parent=styles['Heading2'], fontSize=8.5,
-                           textColor=colors.HexColor('#2c3e50'),
-                           spaceBefore=3, spaceAfter=1.5, leading=10)
-        N = ParagraphStyle('N', parent=styles['Normal'], fontSize=6.5,
-                           textColor=colors.HexColor('#333333'),
-                           leading=7.8)
-        MONO = ParagraphStyle('M', parent=styles['Normal'], fontSize=6,
-                              textColor=colors.HexColor('#2c3e50'),
-                              leading=7.2,
-                              fontName='Courier')
-        DANGER = ParagraphStyle('D', parent=styles['Normal'], fontSize=6.5,
-                                textColor=colors.HexColor('#78281F'),
-                                leading=8)
-        CELL = ParagraphStyle('C', parent=styles['Normal'], fontSize=6.3,
-                              leading=7.4)
-        CELL_W = ParagraphStyle('CW', parent=styles['Normal'], fontSize=6.3,
-                                textColor=colors.white, leading=7.4)
-        CELL_MONO = ParagraphStyle('CM', parent=styles['Normal'],
-                                   fontSize=5.7, leading=6.8,
-                                   fontName='Courier',
-                                   textColor=colors.HexColor('#2c3e50'))
+        P = lambda n, **kw: ParagraphStyle(n, parent=styles['Normal'], **kw)
+        BODY = P('b', fontSize=6.6, leading=7.8,
+                 textColor=colors.HexColor('#1f2937'))
+        H = P('h', fontSize=8.2, leading=9.6, spaceAfter=2,
+              textColor=colors.HexColor('#0f172a'),
+              fontName='Helvetica-Bold')
+        CELL = P('c', fontSize=6.2, leading=7.2,
+                 textColor=colors.HexColor('#1f2937'))
+        CELLW = P('cw', fontSize=6.2, leading=7.2, textColor=colors.white,
+                  fontName='Helvetica-Bold')
+        MONO = P('m', fontSize=5.9, leading=7.0, fontName='Courier',
+                 textColor=colors.HexColor('#334155'))
+        TITLE = P('t', fontSize=13, leading=14.5, textColor=colors.white,
+                  fontName='Helvetica-Bold')
+        SUBT = P('s', fontSize=6.8, leading=8.4,
+                 textColor=colors.HexColor('#cbd5e1'))
 
-        story = []
-        r = self.results
-        hs = r['header_speed']
+        def grid(head, rows, widths, head_bg='#334155'):
+            data = [[Paragraph(str(c), CELLW) for c in head]]
+            for row in rows:
+                data.append([c if isinstance(c, Paragraph)
+                             else Paragraph(str(c), CELL) for c in row])
+            t = Table(data, colWidths=widths, hAlign='LEFT')
+            st = [('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(head_bg)),
+                  ('GRID', (0, 0), (-1, -1), 0.35,
+                   colors.HexColor('#cbd5e1')),
+                  ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                  ('PADDING', (0, 0), (-1, -1), 1.7),
+                  ('LEFTPADDING', (0, 0), (-1, -1), 3)]
+            for i in range(1, len(data)):
+                if i % 2 == 0:
+                    st.append(('BACKGROUND', (0, i), (-1, i),
+                               colors.HexColor('#f8fafc')))
+            t.setStyle(TableStyle(st))
+            return t
 
-        # ===== header =====
-        story.append(Paragraph(
-            "SECURITY AUDIT &amp; VULNERABILITY ASSESSMENT", TITLE))
-        story.append(Paragraph(
-            f"Target: <b>{_esc(self.domain)}</b> &nbsp;|&nbsp; "
-            f"IP: {_esc(self.ip)} &nbsp;|&nbsp; "
-            f"Date: {_esc(r['audit_date'])}", SUB))
-        story.append(HRFlowable(
-            width="100%", thickness=1.1,
-            color=colors.HexColor('#3498db'),
-            spaceBefore=2, spaceAfter=3))
+        total_w = A4[0] - 2 * 34
 
-        # ===== overview =====
-        ssl_info = r['ssl']
-        if not ssl_info.get('enabled'):
-            ssl_txt = "Not enabled"
-        elif ssl_info.get('error'):
-            ssl_txt = "Invalid"
-        else:
-            ssl_txt = f"{ssl_info['days_left']}d left"
-
-        em = r['email']
-        dmarc_txt = "Set" if em.get('dmarc') else (
-            "Missing" if em.get('dns_available') else "N/A")
-        spf_txt = "Set" if em.get('spf') else (
-            "Missing" if em.get('dns_available') else "N/A")
-
-        overview = [
-            [Paragraph('<b>Target</b>', CELL), _esc(self.domain),
-             Paragraph('<b>HTTP</b>', CELL), _esc(hs.get('status')),
-             Paragraph('<b>Response</b>', CELL),
-             f"{hs.get('latency', 0)} ms"],
-            [Paragraph('<b>IP</b>', CELL), _esc(self.ip),
-             Paragraph('<b>Server</b>', CELL),
-             _esc(str(hs.get('server'))[:22]) or 'Hidden',
-             Paragraph('<b>CDN</b>', CELL), _esc(r.get('cdn') or 'None')],
-            [Paragraph('<b>SSL Cert</b>', CELL), ssl_txt,
-             Paragraph('<b>SPF</b>', CELL), spf_txt,
-             Paragraph('<b>DMARC</b>', CELL), dmarc_txt],
-        ]
-        t_ov = Table(overview, colWidths=[60, 130, 55, 120, 60, 143])
-        t_ov.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
-            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#e2e8f0')),
+        # ---- header band ----
+        band = Table([[
+            Paragraph("SECURITY AUDIT &amp; VULNERABILITY ASSESSMENT", TITLE),
+            Paragraph(
+                f"<b>{_esc(self.domain)}</b><br/>"
+                f"IP {_esc(self.ip)} &nbsp;|&nbsp; "
+                f"{_esc(r['audit_date'])}<br/>"
+                f"{_esc(r['tool'])}", SUBT)]],
+            colWidths=[total_w * 0.62, total_w * 0.38])
+        band.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#0f172a')),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('PADDING', (0, 0), (-1, -1), 2),
-        ]))
-        story.append(t_ov)
-        story.append(Spacer(1, 3))
-
-        # ===== 1. charts =====
-        story.append(Paragraph("1. Visual Diagnostic Dashboard", H))
-        story.append(Image(chart1, width=568, height=125))
-        story.append(Spacer(1, 2))
-
-        # ===== 2. PoC summary =====
-        story.append(Paragraph(
-            "2. Verified Findings &amp; Proof-of-Concept", H))
-        poc_items = []
-        for ef in r['exposed_files']:
-            poc_items.append(
-                f"<b>DATA LEAK:</b> File accessible at "
-                f"<u>{_esc(ef['url'])}</u> ({ef['size']} bytes)")
-        if '3306' in r.get('open_ports', []):
-            poc_items.append(
-                "<b>EXPOSED DATABASE:</b> MySQL 3306 reachable "
-                "from internet — credential brute-force possible.")
-        if '21' in r.get('open_ports', []):
-            poc_items.append(
-                "<b>FTP EXPOSED:</b> Port 21 open — plaintext "
-                "credentials if used.")
-        if ssl_info.get('expired'):
-            poc_items.append(
-                "<b>EXPIRED SSL:</b> Browsers show 'Not Secure' "
-                "warning to every visitor.")
-        elif ssl_info.get('expiring_soon'):
-            poc_items.append(
-                f"<b>SSL EXPIRING:</b> {ssl_info['days_left']} days "
-                f"until certificate expiration.")
-        if r.get('https_redirect') is False:
-            poc_items.append(
-                "<b>NO HTTPS REDIRECT:</b> HTTP traffic not upgraded "
-                "— MITM interception possible.")
-        if em.get('dns_available') and not em.get('dmarc'):
-            poc_items.append(
-                f"<b>NO DMARC:</b> Anyone can send spoofed email as "
-                f"@{_esc(self.domain)} — phishing &amp; brand abuse risk.")
-        if not poc_items:
-            poc_items.append(
-                "No critical active vulnerabilities detected in "
-                "this assessment on standard attack surfaces.")
-
-        threat_html = "<br/>".join([f"&bull; {i}" for i in poc_items[:5]])
-        t_poc = Table([[Paragraph(
-            f"<b>VERIFIED FINDINGS:</b><br/>{threat_html}", DANGER)]],
-            colWidths=[568])
-        t_poc.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#FDEDEC')),
-            ('BOX', (0, 0), (-1, -1), 0.8, colors.HexColor('#E74C3C')),
-            ('LEFTPADDING', (0, 0), (-1, -1), 6),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-            ('TOPPADDING', (0, 0), (-1, -1), 3),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ]))
-        story.append(t_poc)
-        story.append(Spacer(1, 3))
-
-        # ===== 3. matrix =====
-        story.append(Paragraph(
-            "3. Technical Matrix — Headers, Ports, Cookies", H))
-
-        hdr_rows = [[Paragraph('<b>Header</b>', CELL_W),
-                     Paragraph('<b>Status</b>', CELL_W)]]
-        short = {'Strict-Transport-Security': 'HSTS',
-                 'Content-Security-Policy': 'CSP',
-                 'X-Frame-Options': 'X-Frame',
-                 'X-Content-Type-Options': 'X-Content',
-                 'Referrer-Policy': 'Referrer',
-                 'Permissions-Policy': 'Permissions'}
-        for k, present in hs.get('sec_headers', {}).items():
-            hdr_rows.append([Paragraph(short.get(k, k), CELL),
-                             Paragraph("Present" if present else "MISSING",
-                                       CELL)])
-        t_hdr = Table(hdr_rows, colWidths=[95, 65])
-        t_hdr.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2c3e50')),
-            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5e1')),
-            ('PADDING', (0, 0), (-1, -1), 1.6),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('ALIGN', (1, 0), (1, 0), 'RIGHT'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 10),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 7),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 7),
         ]))
 
-        p_rows = [[Paragraph('<b>Port</b>', CELL_W),
-                   Paragraph('<b>Service</b>', CELL_W),
-                   Paragraph('<b>State</b>', CELL_W)]]
-        pnames = {21: 'FTP', 22: 'SSH', 80: 'HTTP', 443: 'HTTPS',
-                  3306: 'MySQL', 8080: 'HTTP-Alt'}
-        port_data = r.get('ports', {})
-        if port_data:
-            for p, state in port_data.items():
-                p_rows.append([Paragraph(str(p), CELL),
-                               Paragraph(pnames.get(p, '?'), CELL),
-                               Paragraph(state, CELL)])
-        else:
-            p_rows.append([Paragraph('—', CELL),
-                           Paragraph('Skipped', CELL),
-                           Paragraph('CDN', CELL)])
-        t_port = Table(p_rows, colWidths=[45, 75, 70])
-        t_port.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
-            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5e1')),
-            ('PADDING', (0, 0), (-1, -1), 1.6),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ]))
+        # ---- summary strip ----
+        def chip(label, value, col='#0f172a'):
+            return Paragraph(
+                f"<font size='5.6' color='#64748b'>{label}</font><br/>"
+                f"<font size='8.4' color='{col}'><b>{value}</b></font>", CELL)
 
-        c_rows = [[Paragraph('<b>Cookie</b>', CELL_W),
-                   Paragraph('<b>Sec</b>', CELL_W),
-                   Paragraph('<b>HOnly</b>', CELL_W)]]
-        for c in r.get('cookies', [])[:5]:
-            c_rows.append([Paragraph(_esc(c['name'][:16]), CELL),
-                           Paragraph('Y' if c['secure'] else 'N', CELL),
-                           Paragraph('Y' if c['httponly'] else 'N', CELL)])
-        if len(c_rows) == 1:
-            c_rows.append([Paragraph('(none set)', CELL),
-                           Paragraph('—', CELL), Paragraph('—', CELL)])
-        t_cookie = Table(c_rows, colWidths=[80, 35, 40])
-        t_cookie.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#5d6d7e')),
-            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#cbd5e1')),
-            ('PADDING', (0, 0), (-1, -1), 1.6),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ]))
-
-        t_row = Table([[t_hdr, t_port, t_cookie]],
-                      colWidths=[165, 195, 160])
-        t_row.setStyle(TableStyle([
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('LEFTPADDING', (0, 0), (-1, -1), 0),
-            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-        ]))
-        story.append(t_row)
-        story.append(Spacer(1, 3))
-
-        # ===== 4. assets =====
-        story.append(Paragraph("4. High-Value Asset Status", H))
-        assets = []
-
-        if ssl_info.get('expired') or ssl_info.get('error'):
-            assets.append(('SSL Certificate', 'INVALID', 'CRITICAL',
-                           '#e74c3c'))
-        elif not ssl_info.get('enabled'):
-            assets.append(('SSL Certificate', 'ABSENT', 'CRITICAL',
-                           '#e74c3c'))
-        elif ssl_info.get('expiring_soon'):
-            assets.append(('SSL Certificate', 'EXPIRING', 'WARNING',
-                           '#f39c12'))
-        else:
-            assets.append(('SSL Certificate', 'VALID', 'SECURE',
-                           '#2ecc71'))
-
-        if r.get('https_redirect'):
-            assets.append(('HTTPS Redirect', 'ACTIVE', 'SECURE', '#2ecc71'))
-        else:
-            assets.append(('HTTPS Redirect', 'OFF', 'WARNING', '#f39c12'))
-
-        if not em.get('dns_available'):
-            assets.append(('Email (DMARC)', 'N/A', 'UNKNOWN', '#95a5a6'))
-        elif em.get('dmarc'):
-            assets.append(('Email (DMARC)', 'SET', 'SECURE', '#2ecc71'))
-        else:
-            assets.append(('Email (DMARC)', 'MISSING', 'HIGH RISK',
-                           '#e74c3c'))
-
-        if '3306' in r.get('open_ports', []):
-            assets.append(('Database (3306)', 'EXPOSED', 'CRITICAL',
-                           '#e74c3c'))
-        else:
-            assets.append(('Database (3306)', 'PROTECTED', 'SECURE',
-                           '#2ecc71'))
-
-        if r['exposed_files']:
-            assets.append(('Backup / Config', 'LEAKED', 'CRITICAL',
-                           '#e74c3c'))
-        else:
-            assets.append(('Backup / Config', 'SECURE', 'SECURE',
-                           '#2ecc71'))
-
-        if r.get('cdn'):
-            assets.append(('WAF / CDN', 'ACTIVE', 'SECURE', '#2ecc71'))
-        else:
-            assets.append(('WAF / CDN', 'NONE', 'WARNING', '#f39c12'))
-
-        card_cells = []
-        for i, (name, state, risk, col) in enumerate(assets):
-            html = (f"<para align=center>"
-                    f"<font size='6' color='#555'><b>{name}</b></font>"
-                    f"<br/>"
-                    f"<font size='8.5' color='{col}'><b>{state}</b></font>"
-                    f"<br/>"
-                    f"<font size='5' color='#888'>{risk}</font>"
-                    f"</para>")
-            card_cells.append(Paragraph(html, CELL))
-            if i < len(assets) - 1:
-                card_cells.append('')
-
-        n = len(assets)
-        card_width = (568 - (n - 1) * 4) / n
-        widths = []
-        for i in range(n):
-            widths.append(card_width)
-            if i < n - 1:
-                widths.append(4)
-
-        t_cards = Table([card_cells], colWidths=widths)
-        style = [
+        tls_txt = ('n/a' if not tls.get('enabled') else
+                   'error' if tls.get('error') else
+                   'unknown' if tls.get('days_left') is None else
+                   f"{tls['days_left']}d")
+        summary = Table([[
+            chip('GRADE / SCORE', f"{grade} &nbsp;{score}/100", gcol),
+            chip('TLS CERTIFICATE', tls_txt,
+                 '#16a34a' if (tls.get('days_left') or 0) > 30 else '#dc2626'),
+            chip('SECURITY HEADERS',
+                 f"{r['passed_headers']}/{r['total_headers']}",
+                 '#16a34a' if r['passed_headers'] == r['total_headers']
+                 else '#d97706'),
+            chip('EXPOSED FILES', str(len(r.get('exposed_files', []))),
+                 '#16a34a' if not r.get('exposed_files') else '#dc2626'),
+            chip('OPEN PORTS', str(len(r.get('open_ports', []))),
+                 '#16a34a' if not r.get('open_ports') else '#d97706'),
+            chip('TTFB / SIZE', f"{home.get('ttfb_ms') or 0:.0f}ms / "
+                                f"{home.get('size_kb', 0)}kB"),
+        ]], colWidths=[total_w / 6.0] * 6)
+        summary.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f1f5f9')),
+            ('BOX', (0, 0), (-1, -1), 0.4, colors.HexColor('#e2e8f0')),
+            ('INNERGRID', (0, 0), (-1, -1), 0.4,
+             colors.HexColor('#e2e8f0')),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
             ('TOPPADDING', (0, 0), (-1, -1), 4),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+        ]))
+
+        # ---- left column ----
+        findings = r.get('findings', [])
+        left_w = total_w * 0.615 - 6
+        f_rows = []
+        for sev, title, ev in findings[:8]:
+            f_rows.append([
+                Paragraph(f"<b>{sev}</b>", ParagraphStyle(
+                    'sv', parent=CELL, fontSize=5.8,
+                    textColor=colors.HexColor(SEV_COLOR.get(sev, '#334155')),
+                    fontName='Helvetica-Bold')),
+                Paragraph(_esc(title[:58]), CELL),
+                Paragraph(_esc(ev[:44]), CELL)])
+        if not f_rows:
+            f_rows = [[Paragraph('<b>INFO</b>', CELL),
+                       Paragraph('No issues detected on standard surfaces',
+                                 CELL), Paragraph('', CELL)]]
+
+        sev_counts = {}
+        for sev, _, _ in findings:
+            sev_counts[sev] = sev_counts.get(sev, 0) + 1
+        sev_line = ' &nbsp;'.join(
+            f"<font color='{SEV_COLOR[s]}'><b>{sev_counts[s]}</b></font> {s}"
+            for s in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW') if sev_counts.get(s))
+
+        left = [
+            Paragraph("1 &nbsp;Security Header Matrix", H),
+            self.header_matrix_chart(total_w * 0.615 - 6),
+            Spacer(1, 5),
+            Paragraph(
+                "2 &nbsp;Verified Findings "
+                + (f"<font size='6' color='#64748b'>({sev_line})</font>"
+                   if sev_line else ""), H),
+            grid(['SEV', 'FINDING', 'EVIDENCE'], f_rows,
+                 [42, left_w * 0.34, left_w - 42 - left_w * 0.34],
+                 '#7f1d1d'),
+            Spacer(1, 5),
+            Paragraph("3 &nbsp;Business Risk Exposure", H),
+            self.risk_chart(total_w * 0.615 - 6),
         ]
-        for i, (_, _, _, col) in enumerate(assets):
-            idx = i * 2
-            style.append(('BACKGROUND', (idx, 0), (idx, 0),
-                          colors.HexColor('#f4f6f7')))
-            style.append(('BOX', (idx, 0), (idx, 0), 0.4,
-                          colors.HexColor('#e2e8f0')))
-            style.append(('LINEABOVE', (idx, 0), (idx, 0), 2.6,
-                          colors.HexColor(col)))
-        t_cards.setStyle(TableStyle(style))
-        story.append(t_cards)
-        story.append(Spacer(1, 4))
 
-        # ===== 5. verify yourself =====
-        story.append(Paragraph(
-            "5. Verify Yourself — Direct Evidence URLs", H))
+        # ---- right column ----
+        assets = []
+        if not tls.get('enabled'):
+            assets.append(('SSL / TLS', 'NONE', 'CRITICAL', '#dc2626'))
+        elif tls.get('error'):
+            assets.append(('SSL / TLS', 'INVALID', 'CRITICAL', '#dc2626'))
+        elif (tls.get('days_left') or 0) < 0:
+            assets.append(('SSL / TLS', 'EXPIRED', 'CRITICAL', '#dc2626'))
+        elif (tls.get('days_left') or 999) < 30:
+            assets.append(('SSL / TLS', f"{tls['days_left']}d", 'WARNING',
+                           '#d97706'))
+        else:
+            assets.append(('SSL / TLS', 'VALID', 'OK', '#16a34a'))
+        assets.append(('HTTPS redirect',
+                       'ON' if r.get('https_redirect') else 'OFF',
+                       'OK' if r.get('https_redirect') else 'HIGH',
+                       '#16a34a' if r.get('https_redirect') else '#dc2626'))
+        if not em.get('dns_available'):
+            assets.append(('DMARC', 'n/a', 'UNKNOWN', '#64748b'))
+        elif em.get('dmarc'):
+            assets.append(('DMARC', str(em.get('dmarc_policy') or 'set'),
+                           'OK', '#16a34a'))
+        else:
+            assets.append(('DMARC', 'MISSING', 'HIGH', '#dc2626'))
+        assets.append(('Exposed files',
+                       str(len(r.get('exposed_files', []))),
+                       'OK' if not r.get('exposed_files') else 'CRITICAL',
+                       '#16a34a' if not r.get('exposed_files') else '#dc2626'))
+        assets.append(('WAF / CDN', r.get('cdn') or 'NONE',
+                       'OK' if r.get('cdn') else 'WARNING',
+                       '#16a34a' if r.get('cdn') else '#d97706'))
+        assets.append(('security.txt',
+                       'present' if r.get('security_txt', {}).get('found')
+                       else 'absent',
+                       'OK' if r.get('security_txt', {}).get('found')
+                       else 'LOW',
+                       '#16a34a' if r.get('security_txt', {}).get('found')
+                       else '#64748b'))
+        a_rows = [[Paragraph(_esc(n), CELL),
+                   Paragraph(f"<b>{_esc(str(v))}</b>", CELL),
+                   Paragraph(f"<font color='{c}'><b>{_esc(str(sv))}"
+                             f"</b></font>", CELL)]
+                  for n, v, sv, c in assets]
 
-        verify_items = []
-        for ef in r.get('exposed_files', [])[:4]:
-            verify_items.append((ef['url'],
-                                 'Your backup / config file is public'))
+        port_rows = [[str(p), PORT_NAMES.get(p, '?'), st]
+                     for p, st in sorted(r.get('ports', {}).items())]
+        if not port_rows:
+            port_rows = [['-', 'skipped', 'CDN']]
+
+        cookie_rows = [[_esc(c['name'][:18]),
+                        'Y' if c['secure'] else 'N',
+                        'Y' if c['httponly'] else 'N',
+                        c['samesite'][:6]]
+                       for c in r.get('cookies', [])[:4]]
+        if not cookie_rows:
+            cookie_rows = [['(none set)', '-', '-', '-']]
+
+        robots = r.get('robots', {})
+        sitemap = r.get('sitemap', {})
+        subs = r.get('subdomains', [])
+        surface = [
+            ['Subdomains', str(len(subs)) + (
+                ' (' + subs[0][1] + ')' if subs else '')],
+            ['robots.txt', 'yes' if robots.get('found') else 'no'],
+            ['sitemap.xml', (f"{sitemap.get('urls', 0)} urls"
+                             if sitemap.get('found') else 'no')],
+            ['security.txt', r.get('security_txt', {}).get('path', 'no')
+             if r.get('security_txt', {}).get('found') else 'no'],
+            ['HTTP methods',
+             ', '.join(r.get('methods', {}).get('allow', [])[:4]) or 'n/a'],
+            ['Emails in source', ', '.join(r.get('emails', [])[:2]) or 'none'],
+        ]
+
+        cert = [
+            ['Issuer', str(tls.get('issuer') or '-')[:26]],
+            ['Expires', str(tls.get('expires') or '-')],
+            ['Protocol',
+             f"{tls.get('protocol') or '-'}"
+             f"{' / ' + str(tls['alpn']) if tls.get('alpn') else ''}"],
+            ['Chain trusted',
+             'yes' if tls.get('verified') else 'no (untrusted issuer)'],
+            ['Cipher', str(tls.get('cipher') or '-')[:34]],
+        ]
+
+        col_w = total_w * 0.385 - 6
+        right = [
+            Paragraph("4 &nbsp;Asset Status", H),
+            grid(['ASSET', 'STATE', 'RISK'], a_rows,
+                 [col_w * 0.42, col_w * 0.30, col_w * 0.28], '#334155'),
+            Spacer(1, 5),
+            Paragraph("5 &nbsp;Certificate &amp; Transport", H),
+            grid(['FIELD', 'VALUE'], cert, [col_w * 0.34, col_w * 0.66],
+                 '#334155'),
+            Spacer(1, 5),
+            Paragraph("6 &nbsp;Ports / Cookies", H),
+            grid(['PORT', 'SERVICE', 'STATE'], port_rows,
+                 [col_w * 0.24, col_w * 0.42, col_w * 0.34], '#334155'),
+            Spacer(1, 2),
+            grid(['COOKIE', 'SEC', 'HTO', 'SAME'], cookie_rows,
+                 [col_w * 0.44, col_w * 0.18, col_w * 0.18, col_w * 0.20],
+                 '#334155'),
+            Spacer(1, 5),
+            Paragraph("7 &nbsp;Attack Surface", H),
+            grid(['ITEM', 'VALUE'], [[_esc(a), _esc(b)] for a, b in surface],
+                 [col_w * 0.40, col_w * 0.60], '#334155'),
+        ]
+
+        body = Table([[left, right]],
+                     colWidths=[total_w * 0.615, total_w * 0.385])
+        body.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (0, 0), 0),
+            ('RIGHTPADDING', (0, 0), (0, 0), 10),
+            ('LEFTPADDING', (1, 0), (1, 0), 8),
+            ('RIGHTPADDING', (1, 0), (1, 0), 0),
+            ('LINEBEFORE', (1, 0), (1, 0), 0.5,
+             colors.HexColor('#e2e8f0')),
+        ]))
 
         ev = r.get('evidence', [])
         if ev:
-            story.append(Paragraph(
-                "The following URLs are <b>live and publicly accessible "
-                "right now</b>. Open them in your own browser to "
-                "confirm — no technical tools required. The first bytes "
-                "extracted below prove the content is genuine data, not "
-                "a placeholder page.", N))
-            story.append(Spacer(1, 2))
-
-            ev_rows = [[Paragraph('<b>File</b>', CELL_W),
-                        Paragraph('<b>Type (magic bytes)</b>', CELL_W),
-                        Paragraph('<b>Content sample (redacted)</b>',
-                                  CELL_W)]]
-            for item in ev[:3]:
-                url_short = item['url'].replace('https://', '')\
-                    .replace('http://', '')[:48]
-                ev_rows.append([
-                    Paragraph(_esc(url_short), CELL_MONO),
-                    Paragraph(_esc(item['signature'][:34]), CELL),
-                    Paragraph(
-                        _esc(item['sample'][:70]) or '(binary content)',
-                        CELL_MONO),
-                ])
-            t_ev = Table(ev_rows, colWidths=[170, 120, 278])
-            t_ev.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0),
-                 colors.HexColor('#7b241c')),
-                ('GRID', (0, 0), (-1, -1), 0.4,
-                 colors.HexColor('#e6b0aa')),
-                ('PADDING', (0, 0), (-1, -1), 1.8),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            story.append(t_ev)
-            story.append(Spacer(1, 3))
-
-            if verify_items:
-                click_list = "<br/>".join(
-                    [f"&rarr; <b>{_esc(u)}</b> &mdash; {_esc(desc)}"
-                     for u, desc in verify_items])
-                t_click = Table([[Paragraph(
-                    f"<b>CLICK-TO-VERIFY (open in browser):</b><br/>"
-                    f"{click_list}", DANGER)]], colWidths=[568])
-                t_click.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, -1),
-                     colors.HexColor('#FDEDEC')),
-                    ('BOX', (0, 0), (-1, -1), 0.8,
-                     colors.HexColor('#E74C3C')),
-                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
-                    ('RIGHTPADDING', (0, 0), (-1, -1), 6),
-                    ('TOPPADDING', (0, 0), (-1, -1), 3),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                ]))
-                story.append(t_click)
+            ev_txt = '<br/>'.join(
+                f"&bull; {_esc(i['url'])} &mdash; {_esc(i['signature'])}"
+                for i in ev[:3])
         else:
-            story.append(Paragraph(
-                "No directly-verifiable file leaks found on standard "
-                "paths. All other findings are supported by live "
-                "response evidence.", N))
-        story.append(Spacer(1, 3))
-
-        # ===== 6. attack surface =====
-        story.append(Paragraph(
-            "6. Discovered Attack Surface", H))
-
-        subs = r.get('subdomains', [])
-        main_ip = self.ip
-        sub_txt = '—'
-        if subs:
-            parts = []
-            for s, host, ip in subs[:5]:
-                marker = '' if ip == main_ip else ' *'
-                parts.append(f"{host}{marker}")
-            sub_txt = ', '.join(parts)
-
-        robots = r.get('robots', {})
-        rob_paths = robots.get('sensitive', []) if robots.get('found') else []
-        rob_txt = ', '.join(rob_paths[:4]) if rob_paths else \
-            ('(none found)' if robots.get('found') else '(no robots.txt)')
-
-        emails = r.get('emails', [])
-        email_txt = ', '.join(emails[:4]) if emails else '(none exposed)'
-
-        vers = r.get('versions', {})
-        ver_txt = ', '.join(f"{k}={v}" for k, v in vers.items()) \
-            if vers else '(none disclosed)'
-
-        surface_rows = [
-            [Paragraph('<b>Subdomains discovered</b>', CELL_W),
-             Paragraph(_esc(sub_txt), CELL_MONO)],
-            [Paragraph('<b>Sensitive paths in robots.txt</b>', CELL_W),
-             Paragraph(_esc(rob_txt), CELL_MONO)],
-            [Paragraph('<b>Emails exposed in page source</b>', CELL_W),
-             Paragraph(_esc(email_txt), CELL_MONO)],
-            [Paragraph('<b>Outdated versions disclosed</b>', CELL_W),
-             Paragraph(_esc(ver_txt), CELL_MONO)],
-        ]
-        t_surf = Table(surface_rows, colWidths=[150, 418])
-        t_surf.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#f8f9fa')),
-            ('GRID', (0, 0), (-1, -1), 0.4, colors.HexColor('#d5d8dc')),
-            ('PADDING', (0, 0), (-1, -1), 2),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ev_txt = ('No publicly readable files were confirmed on the '
+                      'standard paths tested.')
+        foot = Table([[Paragraph(
+            f"<b>Self-verification:</b> {ev_txt}", BODY)]],
+            colWidths=[total_w])
+        foot.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#fef2f2')
+             if ev else colors.HexColor('#f8fafc')),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#fecaca')
+             if ev else colors.HexColor('#e2e8f0')),
+            ('LEFTPADDING', (0, 0), (-1, -1), 7),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 7),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
         ]))
-        story.append(t_surf)
-        story.append(Spacer(1, 3))
 
-        # ===== 7. remediation =====
-        fixes = self.plan_remediation()
-        story.append(Paragraph(
-            "7. Prioritized Remediation Plan", H))
-        if fixes:
-            fix_rows = [[Paragraph('<b>Issue</b>', CELL_W),
-                         Paragraph('<b>Priority</b>', CELL_W),
-                         Paragraph('<b>Effort</b>', CELL_W)]]
-            for issue, prio, effort in fixes:
-                fix_rows.append([
-                    Paragraph(_esc(issue[:80]), CELL),
-                    Paragraph(prio, CELL),
-                    Paragraph(effort, CELL),
-                ])
-            t_fix = Table(fix_rows, colWidths=[388, 90, 90])
-            t_fix.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0),
-                 colors.HexColor('#1e8449')),
-                ('GRID', (0, 0), (-1, -1), 0.4,
-                 colors.HexColor('#cbd5e1')),
-                ('PADDING', (0, 0), (-1, -1), 1.8),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            story.append(t_fix)
-        story.append(Spacer(1, 3))
+        disclaimer = Paragraph(
+            "<font size='5.2' color='#94a3b8'>Passive assessment of publicly "
+            "observable configuration only; no exploitation was attempted and "
+            "no authentication was bypassed. Findings reflect the state at "
+            f"scan time. Generated by {_esc(r['tool'])}.</font>", BODY)
 
-        # ===== 8. risk chart =====
-        story.append(Paragraph(
-            "8. Business Threat Exposure Profile", H))
-        story.append(Image(chart2, width=568, height=62))
+        story = [band, Spacer(1, 5), summary, Spacer(1, 7), body,
+                 Spacer(1, 6), foot, Spacer(1, 3), disclaimer]
 
-        story.append(Spacer(1, 1))
-        story.append(HRFlowable(width="100%", thickness=0.4,
-                                color=colors.HexColor('#bdc3c7')))
-        story.append(Paragraph(
-            f"<font size='5.5' color='#888'>Assessment based on "
-            f"publicly observable configuration. No exploitation "
-            f"attempted. Report generated by SiteAuditor v2.1 for "
-            f"{_esc(self.domain)}.</font>", N))
-
+        doc = SimpleDocTemplate(
+            pdf_path, pagesize=A4, rightMargin=34, leftMargin=34,
+            topMargin=30, bottomMargin=26,
+            title=f"Security Audit - {self.domain}",
+            author="SiteAuditor v3.0")
         doc.build(story)
-
-        for p in (chart1, chart2):
-            if os.path.exists(p):
-                os.remove(p)
 
         print(f"\n[\u2713] Report saved: {pdf_path}")
         return pdf_path
 
     def print_terminal_summary(self):
         s = self.results['security_score']
+        g = self.results['grade']
         c = CLR
-        print(f"\n{c['c']}{'=' * 54}{c['r']}")
+        col = (c['g'] if s >= 80 else c['y'] if s >= 60 else c['red'])
+        print(f"\n{c['c']}{'=' * 56}{c['r']}")
         print(f"{c['b']}Audit Summary: {self.domain}{c['r']}")
-        print(f"  Score: {s}/100")
-        if s < 40:
-            print(f"  Pitch potential: {c['red']}{c['b']}HIGH{c['r']} "
-                  f"(poor posture)")
-        elif s < 70:
-            print(f"  Pitch potential: {c['y']}{c['b']}MEDIUM{c['r']}")
-        else:
-            print(f"  Pitch potential: {c['g']}{c['b']}LOW{c['r']} "
-                  f"(well configured)")
-        print(f"  Findings: {len(self.results['exposed_files'])} file(s), "
-              f"{len(self.results['open_ports'])} port(s), "
-              f"{len(self.results.get('subdomains', []))} subdomain(s)")
-        print(f"{c['c']}{'=' * 54}{c['r']}\n")
+        print(f"  Score: {col}{c['b']}{s}/100  (grade {g}){c['r']}")
+        counts = {}
+        for sev, _, _ in self.results.get('findings', []):
+            counts[sev] = counts.get(sev, 0) + 1
+        print("  Findings: " + (', '.join(
+            f"{counts[k]} {k}" for k in
+            ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW') if counts.get(k)) or 'none'))
+        print(f"  Files: {len(self.results['exposed_files'])} | "
+              f"Ports: {len(self.results['open_ports'])} | "
+              f"Subdomains: {len(self.results.get('subdomains', []))}")
+        print(f"{c['c']}{'=' * 56}{c['r']}\n")
+
+
+CLR = {'r': "\033[0m", 'b': "\033[1m", 'red': "\033[91m",
+       'g': "\033[92m", 'y': "\033[93m", 'c': "\033[96m"}
 
 
 if __name__ == '__main__':
@@ -1266,6 +1250,7 @@ if [ -n "$PY" ] && "$PY" -c \
     echo ""
     echo "✓ installed: $BINDIR/audit"
     echo "  run it with:  audit example.com"
+    echo "  needs:  pip install reportlab requests dnspython"
     [ -d "$HOME/storage/shared" ] || echo \
         "  tip: run 'termux-setup-storage' once so reports land in shared storage"
 else

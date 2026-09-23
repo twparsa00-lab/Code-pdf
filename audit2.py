@@ -1,4 +1,3 @@
-cat << 'EOF' > audit2.py
 #!/usr/bin/env python3
 """
 SiteAuditor v2.1 — Real-world security audit with byte-level PoC evidence.
@@ -1219,9 +1218,3 @@ if __name__ == '__main__':
     auditor.run_audit()
     auditor.generate_pdf()
     auditor.print_terminal_summary()
-EOF
-chmod +x audit2.py
-cp audit2.py $PREFIX/bin/audit
-chmod +x $PREFIX/bin/audit
-echo ""
-echo "✓ audit updated. Run with:  audit example.com"
